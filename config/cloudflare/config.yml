@@ -1,0 +1,77 @@
+# =============================================================================
+# Cloudflare Tunnel — Referência de rotas (config.yml)
+#
+# MODO PADRÃO DESTE SETUP: Token-based (variável CLOUDFLARE_TUNNEL_TOKEN)
+# Neste modo, o cloudflared ignora este arquivo e usa as rotas configuradas
+# diretamente no dashboard Cloudflare.
+#
+# Este arquivo serve como:
+#   1. Documentação das rotas esperadas
+#   2. Configuração alternativa para quem preferir o modo "credentials file"
+#
+# =============================================================================
+# PASSO A PASSO NO DASHBOARD CLOUDFLARE:
+#
+# 1. Acesse: https://one.dash.cloudflare.com/
+# 2. Vá em: Networks > Tunnels > Create a tunnel
+# 3. Escolha: Cloudflared
+# 4. Nomeie o tunnel (ex: datalake-bomgado)
+# 5. Copie o token e cole no .env (CLOUDFLARE_TUNNEL_TOKEN=...)
+# 6. Na aba "Public Hostname", adicione as rotas abaixo:
+#
+# ┌─────────────────────────────┬──────────────────────────────┐
+# │ Subdomain / Domain          │ Service                      │
+# ├─────────────────────────────┼──────────────────────────────┤
+# │ minio.bomgado.com.br        │ http://minio:9001            │
+# │ s3.bomgado.com.br           │ http://minio:9000            │
+# │ trino.bomgado.com.br        │ http://trino:8080            │
+# │ livy.bomgado.com.br         │ http://livy:8998             │
+# │ iceberg.bomgado.com.br      │ http://iceberg-rest:8181     │
+# │ spark.bomgado.com.br        │ http://spark-master:8080     │
+# └─────────────────────────────┴──────────────────────────────┘
+#
+# OBSERVAÇÃO DE SEGURANÇA:
+#   O Cloudflare Zero Trust (Access) pode ser configurado para proteger
+#   os endpoints acima com autenticação (Google, GitHub, e-mail OTP, etc.)
+#   Recomendado especialmente para livy.* e iceberg.*
+#   Acesse: Zero Trust > Access > Applications > Add an application
+#
+# =============================================================================
+# MODO ALTERNATIVO: Credentials File (para uso local/CI sem dashboard)
+#
+# Se preferir não usar o dashboard, descomente e ajuste abaixo,
+# e substitua o command do cloudflared no docker-compose.yml por:
+#   command: tunnel --config /etc/cloudflared/config.yml run
+# =============================================================================
+
+# tunnel: <TUNNEL_ID>
+# credentials-file: /etc/cloudflared/credentials/<TUNNEL_ID>.json
+#
+# ingress:
+#   - hostname: minio.bomgado.com.br
+#     service: http://minio:9001
+#
+#   - hostname: s3.bomgado.com.br
+#     service: http://minio:9000
+#     # Permite uploads grandes sem timeout do Cloudflare
+#     originRequest:
+#       connectTimeout: 30s
+#       noTLSVerify: false
+#
+#   - hostname: trino.bomgado.com.br
+#     service: http://trino:8080
+#
+#   - hostname: livy.bomgado.com.br
+#     service: http://livy:8998
+#     # Jobs Spark podem demorar — aumenta timeout
+#     originRequest:
+#       connectTimeout: 60s
+#
+#   - hostname: iceberg.bomgado.com.br
+#     service: http://iceberg-rest:8181
+#
+#   - hostname: spark.bomgado.com.br
+#     service: http://spark-master:8080
+#
+#   # Regra catch-all obrigatória (deve ser a última)
+#   - service: http_status:404

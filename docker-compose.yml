@@ -1,0 +1,257 @@
+# =============================================================================
+# Data Lake On-Premises — Stack: MinIO + Iceberg + Spark + Livy + Trino + Cloudflare
+# Rede interna: datalake-net
+#
+# NOTA: Airflow (https://airflow.bomgado.com.br) e Apache Hop
+#       (https://hop.bomgado.com.br) são serviços externos.
+#
+# Comunicação interna Docker:
+#   spark-master  → spark://spark-master:7077
+#   minio         → http://minio:9000
+#   iceberg-rest  → http://iceberg-rest:8181
+#   livy          → http://livy:8998
+#
+# Acesso externo via Cloudflare Tunnel (HTTPS):
+#   livy     → https://livy.<DOMAIN>     ← submissão de jobs Spark (REST)
+#   iceberg  → https://iceberg.<DOMAIN>  ← catálogo de tabelas
+#   s3       → https://s3.<DOMAIN>       ← MinIO S3 API
+#   trino    → https://trino.<DOMAIN>    ← queries ad-hoc
+# =============================================================================
+
+version: "3.8"
+
+# ---------------------------------------------------------------------------
+# Rede bridge compartilhada. Resolve nomes de serviço como DNS interno.
+# ---------------------------------------------------------------------------
+networks:
+  datalake-net:
+    driver: bridge
+
+# ---------------------------------------------------------------------------
+# Volumes persistentes declarados explicitamente para facilitar backup/inspeção
+# ---------------------------------------------------------------------------
+volumes:
+  minio-data:
+  spark-logs:
+
+# =============================================================================
+# SERVIÇOS
+# =============================================================================
+services:
+
+  # ---------------------------------------------------------------------------
+  # STORAGE — MinIO
+  # S3-compatible object store. Porta 9000 = API S3, Porta 9001 = Console Web.
+  # Acesso interno pelos demais containers: http://minio:9000
+  # Acesso externo (Airflow/Hop remotos): http://<IP_HOST>:9000
+  # Console Web: http://localhost:9001 (credenciais: minioadmin / minioadmin)
+  # ---------------------------------------------------------------------------
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "9000:9000"   # S3 API — acessível pelo Airflow e Hop externos
+      - "9001:9001"   # Console Web
+    volumes:
+      - minio-data:/data
+    networks:
+      - datalake-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # Cria os buckets necessários assim que o MinIO estiver saudável.
+  # 'datalake' = dados brutos/processados; 'warehouse' = tabelas Iceberg.
+  minio-init:
+    image: minio/mc:latest
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - datalake-net
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin} &&
+        mc mb --ignore-existing local/datalake &&
+        mc mb --ignore-existing local/warehouse &&
+        echo '>>> Buckets [datalake] e [warehouse] prontos.'
+      "
+    restart: on-failure
+
+  # ---------------------------------------------------------------------------
+  # CATÁLOGO ICEBERG — REST Catalog (tabulario/iceberg-rest)
+  # Tanto o Spark quanto o Trino (internos) usam este catálogo.
+  # Endpoint interno:  http://iceberg-rest:8181
+  # Endpoint externo:  http://<IP_HOST>:8181  ← acessível pelo Airflow remoto
+  # ---------------------------------------------------------------------------
+  iceberg-rest:
+    image: tabulario/iceberg-rest:0.10.0
+    container_name: iceberg-rest
+    environment:
+      - AWS_ACCESS_KEY_ID=${MINIO_ROOT_USER:-minioadmin}
+      - AWS_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD:-minioadmin}
+      - AWS_REGION=us-east-1
+      # Local onde os metadados das tabelas Iceberg serão gravados no MinIO
+      - CATALOG_WAREHOUSE=s3://warehouse/
+      - CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO
+      # Redireciona chamadas S3 para o MinIO local (path-style = sem subdomain)
+      - CATALOG_S3_ENDPOINT=http://minio:9000
+      - CATALOG_S3_PATH__STYLE__ACCESS=true
+    ports:
+      - "8181:8181"
+    networks:
+      - datalake-net
+    depends_on:
+      - minio-init
+
+  # ---------------------------------------------------------------------------
+  # PROCESSAMENTO — Apache Spark Standalone (Master + Worker)
+  # Master RPC interno:  spark://spark-master:7077
+  # Master RPC externo:  spark://<IP_HOST>:7077  ← usado pelo Airflow remoto
+  # Master Web UI:       http://localhost:8090
+  # Worker Web UI:       http://localhost:8091
+  #
+  # IMPORTANTE: para o SparkSubmitOperator do Airflow externo funcionar em
+  # modo 'client', o IP do host deve ser roteável a partir de
+  # airflow.bomgado.com.br. Use deploy_mode='cluster' ou uma VPN se
+  # os servidores estiverem em redes distintas.
+  # ---------------------------------------------------------------------------
+  spark-master:
+    image: bitnami/spark:3.5
+    container_name: spark-master
+    environment:
+      - SPARK_MODE=master
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    ports:
+      - "8090:8080"   # Spark Master Web UI
+      - "8090:8080"   # Spark Master Web UI (exposto via Cloudflare como spark.<DOMAIN>)
+      # NOTA: porta 7077 (RPC) NÃO é exposta externamente.
+      # O Airflow remoto submete jobs via Apache Livy (REST/HTTPS), não por RPC direto.
+    volumes:
+      - spark-logs:/opt/bitnami/spark/logs
+      - ./config/spark/conf/spark-defaults.conf:/opt/bitnami/spark/conf/spark-defaults.conf:ro
+      - ./scripts:/opt/spark/scripts:ro
+    networks:
+      - datalake-net
+    depends_on:
+      - iceberg-rest
+
+  spark-worker:
+    image: bitnami/spark:3.5
+    container_name: spark-worker
+    environment:
+      - SPARK_MODE=worker
+      # Registra-se no master pela rede interna Docker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=2G
+      - SPARK_WORKER_CORES=2
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    ports:
+      - "8091:8081"   # Spark Worker Web UI
+    volumes:
+      - spark-logs:/opt/bitnami/spark/logs
+      - ./config/spark/conf/spark-defaults.conf:/opt/bitnami/spark/conf/spark-defaults.conf:ro
+      - ./scripts:/opt/spark/scripts:ro
+    networks:
+      - datalake-net
+    depends_on:
+      - spark-master
+
+  # ---------------------------------------------------------------------------
+  # QUERY ENGINE — Trino
+  # UI / JDBC interno: http://trino:8080
+  # Exposto externamente via Cloudflare: https://trino.<DOMAIN>
+  # Catálogo 'iceberg' aponta para o Iceberg REST Catalog + MinIO
+  # ---------------------------------------------------------------------------
+  trino:
+    image: trinodb/trino:450
+    container_name: trino
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config/trino/etc:/etc/trino:ro
+    networks:
+      - datalake-net
+    depends_on:
+      - iceberg-rest
+
+  # ---------------------------------------------------------------------------
+  # REST GATEWAY — Apache Livy
+  # Fornece uma REST API para submissão de jobs Spark, eliminando a
+  # necessidade de expor o protocolo TCP do Spark (porta 7077) externamente.
+  # O Airflow remoto usa o LivyOperator apontando para:
+  #   https://livy.<DOMAIN>  (via Cloudflare Tunnel)
+  #
+  # Endpoint interno: http://livy:8998
+  # Endpoint externo: https://livy.<DOMAIN>
+  # ---------------------------------------------------------------------------
+  livy:
+    image: apache/livy:0.8.0-incubating
+    container_name: livy
+    environment:
+      # Aponta o Livy para o Spark Master interno
+      - LIVY_SPARK_MASTER=spark://spark-master:7077
+    ports:
+      - "8998:8998"   # Livy REST API (também exposto via Cloudflare)
+    volumes:
+      - ./config/livy:/opt/livy/conf:ro
+      - ./scripts:/opt/spark/scripts:ro
+      - ./config/spark/conf/spark-defaults.conf:/opt/livy/conf/spark-defaults.conf:ro
+    networks:
+      - datalake-net
+    depends_on:
+      - spark-master
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8998/sessions"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # CLOUDFLARE TUNNEL — cloudflared
+  # Expõe os serviços HTTP internos para a internet sem abrir portas no
+  # firewall/roteador. Autentica via token (CLOUDFLARE_TUNNEL_TOKEN no .env).
+  #
+  # O token é obtido no dashboard Cloudflare:
+  #   https://one.dash.cloudflare.com/ > Networks > Tunnels > Create a tunnel
+  #
+  # Rotas configuradas no dashboard (Public Hostnames):
+  #   minio.<DOMAIN>   → http://minio:9001
+  #   s3.<DOMAIN>      → http://minio:9000
+  #   trino.<DOMAIN>   → http://trino:8080
+  #   livy.<DOMAIN>    → http://livy:8998
+  #   iceberg.<DOMAIN> → http://iceberg-rest:8181
+  #   spark.<DOMAIN>   → http://spark-master:8080
+  # ---------------------------------------------------------------------------
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
+    # O token inclui as rotas definidas no dashboard — não precisa de config.yml.
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
+    networks:
+      - datalake-net
+    depends_on:
+      minio:
+        condition: service_healthy
+      livy:
+        condition: service_healthy
+      trino:
+        condition: service_started
+      iceberg-rest:
+        condition: service_started
+    restart: unless-stopped
